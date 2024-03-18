@@ -12,12 +12,9 @@ const ratelimit = new Ratelimit({
 
 export default async function Home() {
   const ip = headers().get("x-forwarded-for");
-  const {
-    success,
-    limit,
-    remaining,
-    reset,
-  } = await ratelimit.limit(ip ?? "anonymous011");
+  const { success, limit, reset } = await ratelimit.limit(ip ?? "anonymous011");
+
+  const remaining = await ratelimit.getRemaining(ip ?? "anonymous011");
 
   return (
     <main className="flex flex-col items-center justify-between min-h-screen p-24">

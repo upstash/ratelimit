@@ -1,7 +1,12 @@
 import { Cache } from "./cache";
 import type { Duration } from "./duration";
 import { ms } from "./duration";
-import { fixedWindowScript, slidingWindowScript } from "./lua-scripts/multi";
+import {
+  fixedWindowLimitScript,
+  fixedWindowRemainingTokensScript,
+  slidingWindowLimitScript,
+  slidingWindowRemainingTokensScript,
+} from "./lua-scripts/multi";
 import { Ratelimit } from "./ratelimit";
 import type { Algorithm, MultiRegionContext } from "./types";
 
@@ -134,122 +139,149 @@ export class MultiRegionRatelimit extends Ratelimit<MultiRegionContext> {
   ): Algorithm<MultiRegionContext> {
     const windowDuration = ms(window);
 
-    return async (ctx: MultiRegionContext, identifier: string, rate?: number) => {
-      if (ctx.cache) {
-        const { blocked, reset } = ctx.cache.isBlocked(identifier);
-        if (blocked) {
-          return {
-            success: false,
-            limit: tokens,
-            remaining: 0,
-            reset: reset,
-            pending: Promise.resolve(),
-          };
-        }
-      }
-
-      const requestId = randomId();
-      const bucket = Math.floor(Date.now() / windowDuration);
-      const key = [identifier, bucket].join(":");
-      const incrementBy = rate ? Math.max(1, rate) : 1;
-
-      const dbs: { redis: Redis; request: Promise<string[]> }[] = ctx.redis.map((redis) => ({
-        redis,
-        request: redis.eval(
-          fixedWindowScript,
-          [key],
-          [requestId, windowDuration, incrementBy],
-        ) as Promise<string[]>,
-      }));
-
-      // The firstResponse is an array of string at every EVEN indexes and rate at which the tokens are used at every ODD indexes
-      const firstResponse = await Promise.any(dbs.map((s) => s.request));
-
-      const usedTokens = firstResponse.reduce((accTokens: number, usedToken, index) => {
-        let parsedToken = 0;
-        if (index % 2) {
-          parsedToken = Number.parseInt(usedToken);
+    return () => ({
+      async limit(ctx: MultiRegionContext, identifier: string, rate?: number) {
+        if (ctx.cache) {
+          const { blocked, reset } = ctx.cache.isBlocked(identifier);
+          if (blocked) {
+            return {
+              success: false,
+              limit: tokens,
+              remaining: 0,
+              reset: reset,
+              pending: Promise.resolve(),
+            };
+          }
         }
 
-        return accTokens + parsedToken;
-      }, 0);
+        const requestId = randomId();
+        const bucket = Math.floor(Date.now() / windowDuration);
+        const key = [identifier, bucket].join(":");
+        const incrementBy = rate ? Math.max(1, rate) : 1;
 
-      const remaining = tokens - usedTokens;
+        const dbs: { redis: Redis; request: Promise<string[]> }[] = ctx.redis.map((redis) => ({
+          redis,
+          request: redis.eval(
+            fixedWindowLimitScript,
+            [key],
+            [requestId, windowDuration, incrementBy],
+          ) as Promise<string[]>,
+        }));
 
-      /**
-       * If the length between two databases does not match, we sync the two databases
-       */
-      async function sync() {
-        const individualIDs = await Promise.all(dbs.map((s) => s.request));
+        // The firstResponse is an array of string at every EVEN indexes and rate at which the tokens are used at every ODD indexes
+        const firstResponse = await Promise.any(dbs.map((s) => s.request));
 
-        const allIDs = Array.from(
-          new Set(
-            individualIDs
-              .flatMap((_) => _)
-              .reduce((acc: string[], curr, index) => {
-                if (index % 2 === 0) {
-                  acc.push(curr);
+        const usedTokens = firstResponse.reduce((accTokens: number, usedToken, index) => {
+          let parsedToken = 0;
+          if (index % 2) {
+            parsedToken = Number.parseInt(usedToken);
+          }
+
+          return accTokens + parsedToken;
+        }, 0);
+
+        const remaining = tokens - usedTokens;
+
+        /**
+         * If the length between two databases does not match, we sync the two databases
+         */
+        async function sync() {
+          const individualIDs = await Promise.all(dbs.map((s) => s.request));
+
+          const allIDs = Array.from(
+            new Set(
+              individualIDs
+                .flatMap((_) => _)
+                .reduce((acc: string[], curr, index) => {
+                  if (index % 2 === 0) {
+                    acc.push(curr);
+                  }
+                  return acc;
+                }, []),
+            ).values(),
+          );
+
+          for (const db of dbs) {
+            const usedDbTokens = (await db.request).reduce(
+              (accTokens: number, usedToken, index) => {
+                let parsedToken = 0;
+                if (index % 2) {
+                  parsedToken = Number.parseInt(usedToken);
                 }
-                return acc;
-              }, []),
-          ).values(),
-        );
 
-        for (const db of dbs) {
-          const usedDbTokens = (await db.request).reduce((accTokens: number, usedToken, index) => {
-            let parsedToken = 0;
-            if (index % 2) {
-              parsedToken = Number.parseInt(usedToken);
+                return accTokens + parsedToken;
+              },
+              0,
+            );
+
+            const dbIds = (await db.request).reduce((ids: string[], currentId, index) => {
+              if (index % 2 === 0) {
+                ids.push(currentId);
+              }
+              return ids;
+            }, []);
+            /**
+             * If the bucket in this db is already full, it doesn't matter which ids it contains.
+             * So we do not have to sync.
+             */
+            if (usedDbTokens >= tokens) {
+              continue;
+            }
+            const diff = allIDs.filter((id) => !dbIds.includes(id));
+            /**
+             * Don't waste a request if there is nothing to send
+             */
+            if (diff.length === 0) {
+              continue;
             }
 
-            return accTokens + parsedToken;
-          }, 0);
-
-          const dbIds = (await db.request).reduce((ids: string[], currentId, index) => {
-            if (index % 2 === 0) {
-              ids.push(currentId);
+            for (const requestId of diff) {
+              await db.redis.hset(key, { [requestId]: incrementBy });
             }
-            return ids;
-          }, []);
-          /**
-           * If the bucket in this db is already full, it doesn't matter which ids it contains.
-           * So we do not have to sync.
-           */
-          if (usedDbTokens >= tokens) {
-            continue;
-          }
-          const diff = allIDs.filter((id) => !dbIds.includes(id));
-          /**
-           * Don't waste a request if there is nothing to send
-           */
-          if (diff.length === 0) {
-            continue;
-          }
-
-          for (const requestId of diff) {
-            await db.redis.hset(key, { [requestId]: incrementBy });
           }
         }
-      }
 
-      /**
-       * Do not await sync. This should not run in the critical path.
-       */
+        /**
+         * Do not await sync. This should not run in the critical path.
+         */
 
-      const success = remaining > 0;
-      const reset = (bucket + 1) * windowDuration;
+        const success = remaining > 0;
+        const reset = (bucket + 1) * windowDuration;
 
-      if (ctx.cache && !success) {
-        ctx.cache.blockUntil(identifier, reset);
-      }
-      return {
-        success,
-        limit: tokens,
-        remaining,
-        reset,
-        pending: sync(),
-      };
-    };
+        if (ctx.cache && !success) {
+          ctx.cache.blockUntil(identifier, reset);
+        }
+        return {
+          success,
+          limit: tokens,
+          remaining,
+          reset,
+          pending: sync(),
+        };
+      },
+      async getRemaining(ctx: MultiRegionContext, identifier: string) {
+        const bucket = Math.floor(Date.now() / windowDuration);
+        const key = [identifier, bucket].join(":");
+
+        const dbs: { redis: Redis; request: Promise<string[]> }[] = ctx.redis.map((redis) => ({
+          redis,
+          request: redis.eval(fixedWindowRemainingTokensScript, [key], [null]) as Promise<string[]>,
+        }));
+
+        // The firstResponse is an array of string at every EVEN indexes and rate at which the tokens are used at every ODD indexes
+        const firstResponse = await Promise.any(dbs.map((s) => s.request));
+        const usedTokens = firstResponse.reduce((accTokens: number, usedToken, index) => {
+          let parsedToken = 0;
+          if (index % 2) {
+            parsedToken = Number.parseInt(usedToken);
+          }
+
+          return accTokens + parsedToken;
+        }, 0);
+
+        return Math.max(0, tokens - usedTokens);
+      },
+    });
   }
 
   /**
@@ -282,130 +314,153 @@ export class MultiRegionRatelimit extends Ratelimit<MultiRegionContext> {
 
     const windowDuration = ms(window);
 
-    return async (ctx: MultiRegionContext, identifier: string, rate?: number) => {
-      // if (ctx.cache) {
-      //   const { blocked, reset } = ctx.cache.isBlocked(identifier);
-      //   if (blocked) {
-      //     return {
-      //       success: false,
-      //       limit: tokens,
-      //       remaining: 0,
-      //       reset: reset,
-      //       pending: Promise.resolve(),
-      //     };
-      //   }
-      // }
+    return () => ({
+      async limit(ctx: MultiRegionContext, identifier: string, rate?: number) {
+        // if (ctx.cache) {
+        //   const { blocked, reset } = ctx.cache.isBlocked(identifier);
+        //   if (blocked) {
+        //     return {
+        //       success: false,
+        //       limit: tokens,
+        //       remaining: 0,
+        //       reset: reset,
+        //       pending: Promise.resolve(),
+        //     };
+        //   }
+        // }
 
-      const requestId = randomId();
-      const now = Date.now();
+        const requestId = randomId();
+        const now = Date.now();
 
-      const currentWindow = Math.floor(now / windowSize);
-      const currentKey = [identifier, currentWindow].join(":");
-      const previousWindow = currentWindow - 1;
-      const previousKey = [identifier, previousWindow].join(":");
-      const incrementBy = rate ? Math.max(1, rate) : 1;
+        const currentWindow = Math.floor(now / windowSize);
+        const currentKey = [identifier, currentWindow].join(":");
+        const previousWindow = currentWindow - 1;
+        const previousKey = [identifier, previousWindow].join(":");
+        const incrementBy = rate ? Math.max(1, rate) : 1;
 
-      const dbs = ctx.redis.map((redis) => ({
-        redis,
-        request: redis.eval(
-          slidingWindowScript,
-          [currentKey, previousKey],
-          [tokens, now, windowDuration, requestId, incrementBy],
-          // lua seems to return `1` for true and `null` for false
-        ) as Promise<[string[], string[], 1 | null]>,
-      }));
+        const dbs = ctx.redis.map((redis) => ({
+          redis,
+          request: redis.eval(
+            slidingWindowLimitScript,
+            [currentKey, previousKey],
+            [tokens, now, windowDuration, requestId, incrementBy],
+            // lua seems to return `1` for true and `null` for false
+          ) as Promise<[string[], string[], 1 | null]>,
+        }));
 
-      const percentageInCurrent = (now % windowDuration) / windowDuration;
-      const [current, previous, success] = await Promise.any(dbs.map((s) => s.request));
+        const percentageInCurrent = (now % windowDuration) / windowDuration;
+        const [current, previous, success] = await Promise.any(dbs.map((s) => s.request));
 
-      const previousUsedTokens = previous.reduce((accTokens: number, usedToken, index) => {
-        let parsedToken = 0;
-        if (index % 2) {
-          parsedToken = Number.parseInt(usedToken);
-        }
-
-        return accTokens + parsedToken;
-      }, 0);
-
-      const currentUsedTokens = current.reduce((accTokens: number, usedToken, index) => {
-        let parsedToken = 0;
-        if (index % 2) {
-          parsedToken = Number.parseInt(usedToken);
-        }
-
-        return accTokens + parsedToken;
-      }, 0);
-
-      const previousPartialUsed = previousUsedTokens * (1 - percentageInCurrent);
-
-      const usedTokens = previousPartialUsed + currentUsedTokens;
-
-      const remaining = tokens - usedTokens;
-
-      /**
-       * If a database differs from the consensus, we sync it
-       */
-      async function sync() {
-        const res = await Promise.all(dbs.map((s) => s.request));
-        const allCurrentIds = res
-          .flatMap(([current]) => current)
-          .reduce((accCurrentIds: string[], curr, index) => {
-            if (index % 2 === 0) {
-              accCurrentIds.push(curr);
-            }
-            return accCurrentIds;
-          }, []);
-
-        for (const db of dbs) {
-          const [_current, previous, _success] = await db.request;
-          const dbIds = previous.reduce((ids: string[], currentId, index) => {
-            if (index % 2 === 0) {
-              ids.push(currentId);
-            }
-            return ids;
-          }, []);
-
-          const usedDbTokens = previous.reduce((accTokens: number, usedToken, index) => {
-            let parsedToken = 0;
-            if (index % 2) {
-              parsedToken = Number.parseInt(usedToken);
-            }
-
-            return accTokens + parsedToken;
-          }, 0);
-          /**
-           * If the bucket in this db is already full, it doesn't matter which ids it contains.
-           * So we do not have to sync.
-           */
-          if (usedDbTokens >= tokens) {
-            continue;
-          }
-          const diff = allCurrentIds.filter((id) => !dbIds.includes(id));
-          /**
-           * Don't waste a request if there is nothing to send
-           */
-          if (diff.length === 0) {
-            continue;
+        const previousUsedTokens = previous.reduce((accTokens: number, usedToken, index) => {
+          let parsedToken = 0;
+          if (index % 2) {
+            parsedToken = Number.parseInt(usedToken);
           }
 
-          for (const requestId of diff) {
-            await db.redis.hset(currentKey, { [requestId]: incrementBy });
+          return accTokens + parsedToken;
+        }, 0);
+
+        const currentUsedTokens = current.reduce((accTokens: number, usedToken, index) => {
+          let parsedToken = 0;
+          if (index % 2) {
+            parsedToken = Number.parseInt(usedToken);
+          }
+
+          return accTokens + parsedToken;
+        }, 0);
+
+        const previousPartialUsed = previousUsedTokens * (1 - percentageInCurrent);
+
+        const usedTokens = previousPartialUsed + currentUsedTokens;
+
+        const remaining = tokens - usedTokens;
+
+        /**
+         * If a database differs from the consensus, we sync it
+         */
+        async function sync() {
+          const res = await Promise.all(dbs.map((s) => s.request));
+          const allCurrentIds = res
+            .flatMap(([current]) => current)
+            .reduce((accCurrentIds: string[], curr, index) => {
+              if (index % 2 === 0) {
+                accCurrentIds.push(curr);
+              }
+              return accCurrentIds;
+            }, []);
+
+          for (const db of dbs) {
+            const [_current, previous, _success] = await db.request;
+            const dbIds = previous.reduce((ids: string[], currentId, index) => {
+              if (index % 2 === 0) {
+                ids.push(currentId);
+              }
+              return ids;
+            }, []);
+
+            const usedDbTokens = previous.reduce((accTokens: number, usedToken, index) => {
+              let parsedToken = 0;
+              if (index % 2) {
+                parsedToken = Number.parseInt(usedToken);
+              }
+
+              return accTokens + parsedToken;
+            }, 0);
+            /**
+             * If the bucket in this db is already full, it doesn't matter which ids it contains.
+             * So we do not have to sync.
+             */
+            if (usedDbTokens >= tokens) {
+              continue;
+            }
+            const diff = allCurrentIds.filter((id) => !dbIds.includes(id));
+            /**
+             * Don't waste a request if there is nothing to send
+             */
+            if (diff.length === 0) {
+              continue;
+            }
+
+            for (const requestId of diff) {
+              await db.redis.hset(currentKey, { [requestId]: incrementBy });
+            }
           }
         }
-      }
 
-      // const success = remaining >= 0;
-      const reset = (currentWindow + 1) * windowDuration;
-      if (ctx.cache && !success) {
-        ctx.cache.blockUntil(identifier, reset);
-      }
-      return {
-        success: Boolean(success),
-        limit: tokens,
-        remaining: Math.max(0, remaining),
-        reset,
-        pending: sync(),
-      };
-    };
+        // const success = remaining >= 0;
+        const reset = (currentWindow + 1) * windowDuration;
+        if (ctx.cache && !success) {
+          ctx.cache.blockUntil(identifier, reset);
+        }
+        return {
+          success: Boolean(success),
+          limit: tokens,
+          remaining: Math.max(0, remaining),
+          reset,
+          pending: sync(),
+        };
+      },
+      async getRemaining(ctx: MultiRegionContext, identifier: string) {
+        const now = Date.now();
+
+        const currentWindow = Math.floor(now / windowSize);
+        const currentKey = [identifier, currentWindow].join(":");
+        const previousWindow = currentWindow - 1;
+        const previousKey = [identifier, previousWindow].join(":");
+
+        const dbs = ctx.redis.map((redis) => ({
+          redis,
+          request: redis.eval(
+            slidingWindowRemainingTokensScript,
+            [currentKey, previousKey],
+            [null],
+            // lua seems to return `1` for true and `null` for false
+          ) as Promise<number>,
+        }));
+
+        const usedTokens = await Promise.any(dbs.map((s) => s.request));
+        return Math.max(0, tokens - usedTokens);
+      },
+    });
   }
 }

@@ -153,7 +153,7 @@ export abstract class Ratelimit<TContext extends Context> {
     const key = [this.prefix, identifier].join(":");
     let timeoutId: any = null;
     try {
-      const arr: Promise<RatelimitResponse>[] = [this.limiter(this.ctx, key, req?.rate)];
+      const arr: Promise<RatelimitResponse>[] = [this.limiter().limit(this.ctx, key, req?.rate)];
       if (this.timeout > 0) {
         arr.push(
           new Promise((resolve) => {
@@ -256,5 +256,46 @@ export abstract class Ratelimit<TContext extends Context> {
       }
     }
     return res!;
+  };
+
+  public resetUsedTokens = async (identifier: string) => {
+    const script = `
+      local pattern = KEYS[1]
+
+      -- Initialize cursor to start from 0
+      local cursor = "0"
+
+      repeat
+          -- Scan for keys matching the pattern
+          local scan_result = redis.call('SCAN', cursor, 'MATCH', pattern)
+
+          -- Extract cursor for the next iteration
+          cursor = scan_result[1]
+
+          -- Extract keys from the scan result
+          local keys = scan_result[2]
+
+          for i=1, #keys do
+          redis.call('DEL', keys[i])
+          end
+
+      -- Continue scanning until cursor is 0 (end of keyspace)
+      until cursor == "0"
+    `;
+    const pattern = [this.prefix, identifier, "*"].join(":");
+
+    if (Array.isArray(this.ctx.redis)) {
+      for (const db of this.ctx.redis) {
+        await db.eval(script, [pattern], [null]);
+      }
+    } else {
+      await this.ctx.redis.eval(script, [pattern], [null]);
+    }
+  };
+
+  public getRemaining = async (identifier: string) => {
+    const pattern = [this.prefix, identifier].join(":");
+
+    return await this.limiter().getRemaining(this.ctx, pattern);
   };
 }

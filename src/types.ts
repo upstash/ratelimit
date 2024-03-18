@@ -58,14 +58,17 @@ export type RatelimitResponse = {
   pending: Promise<unknown>;
 };
 
-export type Algorithm<TContext> = (
-  ctx: TContext,
-  identifier: string,
-  rate?: number,
-  opts?: {
-    cache?: EphemeralCache;
-  },
-) => Promise<RatelimitResponse>;
+export type Algorithm<TContext> = () => {
+  limit: (
+    ctx: TContext,
+    identifier: string,
+    rate?: number,
+    opts?: {
+      cache?: EphemeralCache;
+    },
+  ) => Promise<RatelimitResponse>;
+  getRemaining: (ctx: TContext, identifier: string) => Promise<number>;
+};
 
 /**
  * This is all we need from the redis sdk.
