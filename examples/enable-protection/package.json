@@ -9,7 +9,7 @@
     "lint": "next lint"
   },
   "dependencies": {
-    "@upstash/ratelimit": "^1.2.0-canary",
+    "@upstash/ratelimit": "^1.2.1",
     "@vercel/functions": "^1.0.2",
     "next": "14.2.3",
     "react": "^18",

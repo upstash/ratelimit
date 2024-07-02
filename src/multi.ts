@@ -302,7 +302,10 @@ export class MultiRegionRatelimit extends Ratelimit<MultiRegionContext> {
           return accTokens + parsedToken;
         }, 0);
 
-        return Math.max(0, tokens - usedTokens);
+        return {
+          remaining: Math.max(0, tokens - usedTokens),
+          reset: (bucket + 1) * windowDuration
+        };
       },
       async resetTokens(ctx: MultiRegionContext, identifier: string) {
         const pattern = [identifier, "*"].join(":");
@@ -514,7 +517,10 @@ export class MultiRegionRatelimit extends Ratelimit<MultiRegionContext> {
         }));
 
         const usedTokens = await Promise.any(dbs.map((s) => s.request));
-        return Math.max(0, tokens - usedTokens);
+        return {
+          remaining: Math.max(0, tokens - usedTokens),
+          reset: (currentWindow + 1) * windowSize
+        };
       },
       async resetTokens(ctx: MultiRegionContext, identifier: string) {
         const pattern = [identifier, "*"].join(":");

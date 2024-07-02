@@ -1,8 +1,8 @@
 import { Redis } from "@upstash/redis";
-import { beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import { beforeEach, describe, expect, test } from "bun:test";
 import { DenyListExtension, IpDenyListStatusKey, IsDenied } from "../types";
 import { checkDenyListScript } from "./scripts";
-import { disableIpDenyList, updateIpDenyList } from "./deny-list-update";
+import { disableIpDenyList, updateIpDenyList } from "./ip-deny-list";
 
 describe("should manage state correctly", async () => {
   const redis = Redis.fromEnv();

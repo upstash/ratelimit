@@ -100,7 +100,10 @@ export type Algorithm<TContext> = () => {
       cache?: EphemeralCache;
     },
   ) => Promise<RatelimitResponse>;
-  getRemaining: (ctx: TContext, identifier: string) => Promise<number>;
+  getRemaining: (ctx: TContext, identifier: string) => Promise<{
+    remaining: number,
+    reset: number
+  }>;
   resetTokens: (ctx: TContext, identifier: string) => Promise<void>;
 };
 

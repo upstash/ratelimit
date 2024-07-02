@@ -17,22 +17,32 @@ function run<TContext extends Context>(builder: Ratelimit<TContext>) {
       // Stop at any random request call within the limit
       const stopAt = Math.floor(Math.random() * (limit - 1) + 1);
       for (let i = 1; i <= limit; i++) {
-        await builder.limit(id);
+
+        const [limitResult, remainigResult] = await Promise.all([
+          builder.limit(id),
+          builder.getRemaining(id)
+        ])
+        
+        expect(limitResult.remaining).toBe(remainigResult.remaining)
+        expect(limitResult.reset).toBe(remainigResult.reset)
         if (i == stopAt) {
           break
         }
       }
 
-      const remaining = await builder.getRemaining(id);
+      const {remaining} = await builder.getRemaining(id);
       expect(remaining).toBe(limit - stopAt);
-    }, 10000);
+    }, {
+      timeout: 10000,
+      retry: 3
+    });
   });
 }
 
 function newRegion(limiter: Algorithm<RegionContext>): Ratelimit<RegionContext> {
   return new RegionRatelimit({
     prefix: crypto.randomUUID(),
-    redis: Redis.fromEnv(),
+    redis: Redis.fromEnv({enableAutoPipelining: true}),
     limiter,
   });
 }
@@ -52,14 +62,17 @@ function newMultiRegion(limiter: Algorithm<MultiRegionContext>): Ratelimit<Multi
       new Redis({
         url: ensureEnv("EU2_UPSTASH_REDIS_REST_URL"),
         token: ensureEnv("EU2_UPSTASH_REDIS_REST_TOKEN"),
+        enableAutoPipelining: true
       }),
       new Redis({
         url: ensureEnv("APN_UPSTASH_REDIS_REST_URL"),
         token: ensureEnv("APN_UPSTASH_REDIS_REST_TOKEN"),
+        enableAutoPipelining: true
       }),
       new Redis({
         url: ensureEnv("US1_UPSTASH_REDIS_REST_URL"),
         token: ensureEnv("US1_UPSTASH_REDIS_REST_TOKEN"),
+        enableAutoPipelining: true
       }),
     ],
     limiter,
